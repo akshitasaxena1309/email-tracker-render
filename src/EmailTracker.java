@@ -51,10 +51,13 @@ public class EmailTracker {
             respond(exchange, 200, "text/plain", "OK".getBytes());
         });
 
-        // Root redirect to dashboard
+        // Compose page - mobile friendly signature generator
+        server.createContext("/compose", exchange -> handleCompose(exchange));
+
+        // Root redirect to compose (more useful on mobile)
         server.createContext("/", exchange -> {
             if ("/".equals(exchange.getRequestURI().getPath())) {
-                exchange.getResponseHeaders().set("Location", "/dashboard");
+                exchange.getResponseHeaders().set("Location", "/compose");
                 exchange.sendResponseHeaders(302, -1);
                 exchange.close();
             }
@@ -184,6 +187,137 @@ public class EmailTracker {
         html.append("<p class='note'>Replace YOUR-APP-NAME with your Render app name, CLIENT_EMAIL with recipient's email, LABEL with a campaign name.</p>");
         html.append("</div>");
 
+        html.append("</body></html>");
+        respond(exchange, 200, "text/html", html.toString().getBytes("UTF-8"));
+    }
+
+    private static void handleCompose(HttpExchange exchange) throws IOException {
+        String host = exchange.getRequestHeaders().getFirst("Host");
+        if (host == null) host = "email-tracker-akshita.onrender.com";
+        String baseUrl = "https://" + host;
+
+        StringBuilder html = new StringBuilder();
+        html.append("<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'>");
+        html.append("<meta name='viewport' content='width=device-width, initial-scale=1.0'>");
+        html.append("<title>Compose Tracked Email</title>");
+        html.append("<style>");
+        html.append("*{margin:0;padding:0;box-sizing:border-box}");
+        html.append("body{font-family:'Segoe UI',system-ui,sans-serif;background:#0a0a1a;color:#e2e8f0;padding:1.2rem;min-height:100vh}");
+        html.append("h1{font-size:1.4rem;color:#a78bfa;margin-bottom:0.2rem}");
+        html.append(".sub{color:#64748b;margin-bottom:1.2rem;font-size:0.85rem}");
+        html.append("label{display:block;font-size:0.8rem;color:#94a3b8;margin-bottom:0.3rem;text-transform:uppercase;letter-spacing:0.05em}");
+        html.append("input[type=text],input[type=email]{width:100%;padding:0.7rem 0.8rem;background:#1a1a2e;border:1px solid #2a2a4a;border-radius:8px;color:#e2e8f0;font-size:1rem;margin-bottom:1rem;outline:none}");
+        html.append("input:focus{border-color:#7c3aed}");
+        html.append(".btn{display:block;width:100%;padding:0.85rem;border:none;border-radius:10px;font-size:1rem;font-weight:600;cursor:pointer;margin-bottom:0.8rem;text-align:center}");
+        html.append(".btn-primary{background:#7c3aed;color:#fff}");
+        html.append(".btn-primary:active{background:#6d28d9}");
+        html.append(".btn-gmail{background:#1a73e8;color:#fff}");
+        html.append(".btn-gmail:active{background:#1557b0}");
+        html.append(".btn-outline{background:transparent;border:1px solid #2a2a4a;color:#94a3b8}");
+        html.append(".preview{background:#1a1a2e;border:1px solid #2a2a4a;border-radius:10px;padding:1rem;margin:1rem 0;font-size:0.9rem;line-height:1.6}");
+        html.append(".preview .name{font-weight:600}");
+        html.append(".success{background:#0a2a1a;border:1px solid #0f5132;border-radius:10px;padding:0.8rem;color:#4ade80;text-align:center;margin-bottom:1rem;display:none;font-size:0.9rem}");
+        html.append(".nav{display:flex;gap:0.5rem;margin-bottom:1.2rem}");
+        html.append(".nav a{flex:1;text-align:center;padding:0.5rem;background:#1a1a2e;border:1px solid #2a2a4a;border-radius:8px;color:#94a3b8;text-decoration:none;font-size:0.8rem}");
+        html.append(".nav a.active{border-color:#7c3aed;color:#a78bfa}");
+        html.append(".step{display:flex;align-items:center;gap:0.6rem;margin-bottom:0.8rem;font-size:0.85rem;color:#94a3b8}");
+        html.append(".step-num{width:24px;height:24px;border-radius:50%;background:#7c3aed;color:#fff;display:flex;align-items:center;justify-content:center;font-size:0.75rem;font-weight:700;flex-shrink:0}");
+        html.append("</style></head><body>");
+
+        html.append("<h1>📧 Compose tracked email</h1>");
+        html.append("<p class='sub'>Works on phone, tablet, desktop — anywhere!</p>");
+
+        html.append("<div class='nav'>");
+        html.append("<a href='/compose' class='active'>Compose</a>");
+        html.append("<a href='/dashboard'>Dashboard</a>");
+        html.append("</div>");
+
+        // Steps
+        html.append("<div class='step'><div class='step-num'>1</div>Enter recipient's email below</div>");
+        html.append("<div class='step'><div class='step-num'>2</div>Tap \"Copy signature\"</div>");
+        html.append("<div class='step'><div class='step-num'>3</div>Open Gmail app → Compose → Paste</div>");
+
+        html.append("<div style='margin-top:1rem'>");
+        html.append("<label>Recipient email</label>");
+        html.append("<input type='email' id='recipient' placeholder='hr@company.com'/>");
+        html.append("<label>Campaign label (optional)</label>");
+        html.append("<input type='text' id='campaign' placeholder='job-apply' value='gmail-mobile'/>");
+        html.append("</div>");
+
+        html.append("<div class='success' id='success'>✅ Signature copied! Now paste in Gmail</div>");
+
+        html.append("<button class='btn btn-primary' onclick='copySignature()'>📋 Copy signature with tracking pixel</button>");
+
+        html.append("<a class='btn btn-gmail' href='#' id='gmailLink' onclick='openGmail()'>✉️ Open Gmail app</a>");
+
+        html.append("<button class='btn btn-outline' onclick='copyPixelOnly()'>Copy tracking pixel only</button>");
+
+        // Preview section
+        html.append("<p style='font-size:0.8rem;color:#64748b;margin:1rem 0 0.5rem'>Preview of your signature:</p>");
+        html.append("<div class='preview' id='preview'>");
+        html.append("<div class='name'>Sincerely,</div>");
+        html.append("Akshita Saxena<br>");
+        html.append("<a style='color:#60a5fa' href='mailto:akshitasaxena38@gmail.com'>akshitasaxena38@gmail.com</a><br>");
+        html.append("+91-9571462508<br>");
+        html.append("<span style='color:#4ade80;font-size:0.75rem'>+ invisible tracking pixel ✓</span>");
+        html.append("</div>");
+
+        html.append("<script>");
+        html.append("var BASE='").append(baseUrl).append("';");
+        html.append("function getSignatureHtml(){");
+        html.append("var r=document.getElementById('recipient').value.trim()||'unknown';");
+        html.append("var c=document.getElementById('campaign').value.trim()||'general';");
+        html.append("return 'Sincerely,\\nAkshita Saxena\\nakshitasaxena38@gmail.com\\n+91-9571462508\\n\\n'");
+        html.append(";}");
+
+        html.append("function getSignatureRich(){");
+        html.append("var r=document.getElementById('recipient').value.trim()||'unknown';");
+        html.append("var c=document.getElementById('campaign').value.trim()||'general';");
+        html.append("var pixelUrl=BASE+'/track?recipient='+encodeURIComponent(r)+'&campaign='+encodeURIComponent(c);");
+        html.append("return '<div>Sincerely,<br><b>Akshita Saxena</b><br>');");
+        html.append("return '');");
+        html.append("}");
+
+        // Rewrite the copy functions properly
+        html.append("function copySignature(){");
+        html.append("var r=document.getElementById('recipient').value.trim()||'unknown';");
+        html.append("var c=document.getElementById('campaign').value.trim()||'general';");
+        html.append("var pixUrl=BASE+'/track?recipient='+encodeURIComponent(r)+'&campaign='+encodeURIComponent(c);");
+        html.append("var plain='Sincerely,\\nAkshita Saxena\\nakshitasaxena38@gmail.com\\n+91-9571462508';");
+        html.append("var rich='<div>Sincerely,<br><b>Akshita Saxena</b><br><a href=\"mailto:akshitasaxena38@gmail.com\">akshitasaxena38@gmail.com</a><br>+91-9571462508<br><img src=\"'+pixUrl+'\" width=\"1\" height=\"1\" style=\"display:none\"></div>';");
+        html.append("try{");
+        html.append("var blob=new Blob([rich],{type:'text/html'});");
+        html.append("var blobT=new Blob([plain],{type:'text/plain'});");
+        html.append("navigator.clipboard.write([new ClipboardItem({'text/html':blob,'text/plain':blobT})]);");
+        html.append("}catch(e){");
+        html.append("var ta=document.createElement('textarea');ta.value=plain+'\\n';");
+        html.append("document.body.appendChild(ta);ta.select();document.execCommand('copy');document.body.removeChild(ta);");
+        html.append("}");
+        html.append("var s=document.getElementById('success');s.style.display='block';");
+        html.append("setTimeout(function(){s.style.display='none'},4000);");
+        html.append("}");
+
+        html.append("function copyPixelOnly(){");
+        html.append("var r=document.getElementById('recipient').value.trim()||'unknown';");
+        html.append("var c=document.getElementById('campaign').value.trim()||'general';");
+        html.append("var pixUrl=BASE+'/track?recipient='+encodeURIComponent(r)+'&campaign='+encodeURIComponent(c);");
+        html.append("var rich='<img src=\"'+pixUrl+'\" width=\"1\" height=\"1\" style=\"display:none\">';");
+        html.append("try{");
+        html.append("var blob=new Blob([rich],{type:'text/html'});");
+        html.append("var blobT=new Blob([' '],{type:'text/plain'});");
+        html.append("navigator.clipboard.write([new ClipboardItem({'text/html':blob,'text/plain':blobT})]);");
+        html.append("}catch(e){navigator.clipboard.writeText(pixUrl);}");
+        html.append("var s=document.getElementById('success');s.textContent='✅ Pixel copied!';s.style.display='block';");
+        html.append("setTimeout(function(){s.style.display='none'},4000);");
+        html.append("}");
+
+        html.append("function openGmail(){");
+        html.append("var r=document.getElementById('recipient').value.trim();");
+        html.append("if(r){window.location='mailto:'+r;}");
+        html.append("else{window.location='mailto:';}");
+        html.append("}");
+
+        html.append("</script>");
         html.append("</body></html>");
         respond(exchange, 200, "text/html", html.toString().getBytes("UTF-8"));
     }
