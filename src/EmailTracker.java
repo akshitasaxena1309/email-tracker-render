@@ -7,17 +7,16 @@ import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.stream.Collectors;
 
 public class EmailTracker {
 
     private static final List<Map<String, String>> openLogs = Collections.synchronizedList(new ArrayList<>());
 
-    // Deduplication: stores "recipient|campaign" -> last logged timestamp
-    private static final ConcurrentHashMap<String, Long> lastLogged = new ConcurrentHashMap<>();
-
-    // Dedup window in milliseconds (5 minutes)
-    private static final long DEDUP_WINDOW_MS = 5 * 60 * 1000;
+    // DEDUPLICATION: Gmail sends 2-3 requests per open (proxy, prefetch, actual)
+    // This map tracks the last logged time per recipient+campaign
+    // Any hit within 60 seconds of the last one is SKIPPED
+    private static final ConcurrentHashMap<String, Long> lastOpenTime = new ConcurrentHashMap<>();
+    private static final long DEDUP_WINDOW_MS = 60_000; // 60 seconds
 
     private static final byte[] TRACKING_PIXEL = Base64.getDecoder().decode(
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVQI12NgAAIABQAB" +
@@ -38,7 +37,10 @@ public class EmailTracker {
         server.createContext("/dashboard", exchange -> handleDashboard(exchange));
         server.createContext("/compose", exchange -> handleCompose(exchange));
         server.createContext("/api/logs", exchange -> handleApi(exchange));
-        server.createContext("/health", exchange -> respond(exchange, 200, "text/plain", "OK".getBytes()));
+
+        server.createContext("/health", exchange -> {
+            respond(exchange, 200, "text/plain", "OK".getBytes());
+        });
 
         server.createContext("/", exchange -> {
             if ("/".equals(exchange.getRequestURI().getPath())) {
@@ -57,104 +59,49 @@ public class EmailTracker {
         Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());
         String recipient = params.getOrDefault("recipient", "unknown");
         String campaign  = params.getOrDefault("campaign", "default");
-        String ip        = exchange.getRemoteAddress().getAddress().getHostAddress();
-        String forwarded = exchange.getRequestHeaders().getFirst("X-Forwarded-For");
-        if (forwarded != null && !forwarded.isEmpty()) ip = forwarded.split(",")[0].trim();
-        String userAgent = exchange.getRequestHeaders().getFirst("User-Agent");
-        String timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
 
-        // Detect status from user agent
-        String status = detectStatus(userAgent);
-        String emailClient = detectEmailClient(userAgent);
+        // Always return the pixel (so email client doesn't show broken image)
+        exchange.getResponseHeaders().set("Content-Type", "image/png");
+        exchange.getResponseHeaders().set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+        exchange.getResponseHeaders().set("Pragma", "no-cache");
+        exchange.getResponseHeaders().set("Expires", "0");
 
-        // --- DEDUPLICATION ---
-        // Skip if same recipient+campaign was logged within last 5 minutes
-        String dedupKey = recipient.toLowerCase() + "|" + campaign.toLowerCase();
+        // ===== DEDUPLICATION =====
+        // Gmail sends 2-3 requests within seconds (proxy + prefetch + actual open)
+        // We only log the FIRST hit and skip duplicates within 60 seconds
+        String dedupKey = recipient + "|" + campaign;
         long now = System.currentTimeMillis();
-        Long lastTime = lastLogged.get(dedupKey);
+        Long lastTime = lastOpenTime.get(dedupKey);
 
         if (lastTime != null && (now - lastTime) < DEDUP_WINDOW_MS) {
-            // Duplicate within 5 minutes — skip logging but still serve pixel
-            System.out.println("[SKIP-DUPLICATE] " + recipient + " | " + campaign + " | within 5 min window");
-
-            // BUT: if previous was "Delivered" and this one is "Read", upgrade the status
-            if ("Read".equals(status)) {
-                for (int i = openLogs.size() - 1; i >= 0; i--) {
-                    Map<String, String> prev = openLogs.get(i);
-                    if (recipient.equalsIgnoreCase(prev.get("recipient")) &&
-                        campaign.equalsIgnoreCase(prev.get("campaign")) &&
-                        "Delivered".equals(prev.get("status"))) {
-                        prev.put("status", "Read \u2705");
-                        prev.put("opened_at", timestamp);
-                        prev.put("email_client", emailClient);
-                        System.out.println("[UPGRADED] " + recipient + " status -> Read");
-                        break;
-                    }
-                }
-            }
-
-            exchange.getResponseHeaders().set("Content-Type", "image/png");
-            exchange.getResponseHeaders().set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+            // This is a duplicate hit from Gmail proxy — SKIP IT
+            System.out.println("[SKIP] Duplicate hit for " + recipient + " (within 60s)");
             respond(exchange, 200, "image/png", TRACKING_PIXEL);
             return;
         }
 
-        // New entry — log it
-        lastLogged.put(dedupKey, now);
+        // This is a REAL open — record it
+        lastOpenTime.put(dedupKey, now);
+        // ===== END DEDUPLICATION =====
+
+        String ip = exchange.getRemoteAddress().getAddress().getHostAddress();
+        String forwarded = exchange.getRequestHeaders().getFirst("X-Forwarded-For");
+        if (forwarded != null && !forwarded.isEmpty()) ip = forwarded.split(",")[0].trim();
+        String userAgent = exchange.getRequestHeaders().getFirst("User-Agent");
+        String timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+        String emailClient = detectEmailClient(userAgent);
 
         Map<String, String> log = new LinkedHashMap<>();
         log.put("recipient", recipient);
         log.put("campaign", campaign);
-        log.put("status", status);
         log.put("opened_at", timestamp);
         log.put("ip_address", ip);
         log.put("email_client", emailClient);
         log.put("user_agent", userAgent != null ? userAgent : "unknown");
         openLogs.add(log);
+        System.out.println("[OPEN] " + timestamp + " | " + recipient + " | " + campaign + " | " + emailClient);
 
-        System.out.println("[" + status.toUpperCase() + "] " + timestamp + " | " + recipient + " | " + campaign + " | " + emailClient);
-
-        exchange.getResponseHeaders().set("Content-Type", "image/png");
-        exchange.getResponseHeaders().set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
-        exchange.getResponseHeaders().set("Pragma", "no-cache");
-        exchange.getResponseHeaders().set("Expires", "0");
         respond(exchange, 200, "image/png", TRACKING_PIXEL);
-    }
-
-    /**
-     * Detect email status from User-Agent:
-     * - Gmail/Google proxy = email was delivered to inbox (proxy prefetches images)
-     * - Actual browser/mail client = user actually opened and read the email
-     */
-    private static String detectStatus(String ua) {
-        if (ua == null) return "Read \u2705";
-        String lower = ua.toLowerCase();
-        if (lower.contains("googleimageproxy") || lower.contains("google-image-proxy")) {
-            return "Delivered";
-        }
-        if (lower.contains("yahoo") && lower.contains("slurp")) {
-            return "Delivered";
-        }
-        if (lower.contains("outlook-ios") || lower.contains("microsoft office")) {
-            return "Read \u2705";
-        }
-        return "Read \u2705";
-    }
-
-    private static String detectEmailClient(String ua) {
-        if (ua == null) return "Unknown";
-        String lower = ua.toLowerCase();
-        if (lower.contains("googleimageproxy")) return "Gmail";
-        if (lower.contains("thunderbird")) return "Thunderbird";
-        if (lower.contains("outlook") || lower.contains("microsoft")) return "Outlook";
-        if (lower.contains("apple") || (lower.contains("webkit") && lower.contains("mac"))) return "Apple Mail";
-        if (lower.contains("yahoo")) return "Yahoo Mail";
-        if (lower.contains("android")) return "Android";
-        if (lower.contains("iphone") || lower.contains("ipad")) return "iPhone";
-        if (lower.contains("chrome")) return "Chrome";
-        if (lower.contains("safari")) return "Safari";
-        if (lower.contains("firefox")) return "Firefox";
-        return "Mail Client";
     }
 
     private static void handleCompose(HttpExchange exchange) throws IOException {
@@ -221,7 +168,8 @@ public class EmailTracker {
         + "<span style='color:#4ade80;font-size:0.75rem'>+ invisible tracking pixel \u2713</span>"
         + "</div>"
 
-        + "<textarea id='copyBox' style='position:fixed;left:-9999px;top:0;' readonly></textarea>"
+        // Hidden textarea for mobile copy fallback
+        + "<textarea id='copyBox' style='position:absolute;left:-9999px;top:-9999px;opacity:0' readonly></textarea>"
 
         + "<script>"
         + "var BASE='" + baseUrl + "';"
@@ -243,14 +191,13 @@ public class EmailTracker {
         + "var box=document.getElementById('copyBox');"
         + "box.value=text;"
         + "box.style.position='static';"
-        + "box.style.left='0';"
+        + "box.style.opacity='0.01';"
         + "box.focus();"
         + "box.select();"
         + "try{box.setSelectionRange(0,99999);}catch(e){}"
         + "var ok=document.execCommand('copy');"
-        + "box.style.position='fixed';"
+        + "box.style.position='absolute';"
         + "box.style.left='-9999px';"
-        + "box.blur();"
         + "return ok;"
         + "}"
 
@@ -266,11 +213,12 @@ public class EmailTracker {
         + "var blobH=new Blob([richHtml],{type:'text/html'});"
         + "var blobT=new Blob([sig],{type:'text/plain'});"
         + "navigator.clipboard.write([new ClipboardItem({'text/html':blobH,'text/plain':blobT})])"
-        + ".then(function(){showMsg('\u2705 Signature copied! Now paste in Gmail');})"
-        + ".catch(function(){if(fallbackCopy(sig)){showMsg('\u2705 Copied (text)! Paste in Gmail');}else{showMsg('\u274C Could not copy. Try long-press to select the preview below.');}});"
-        + "}catch(e){if(fallbackCopy(sig)){showMsg('\u2705 Copied! Paste in Gmail');}else{showMsg('\u274C Could not copy.');}}"
+        + ".then(function(){showMsg('\\u2705 Signature copied! Now paste in Gmail');})"
+        + ".catch(function(){fallbackCopy(sig);showMsg('\\u2705 Copied as text! Paste in Gmail');});"
+        + "}catch(e){fallbackCopy(sig);showMsg('\\u2705 Copied! Paste in Gmail');}"
         + "}else{"
-        + "if(fallbackCopy(sig)){showMsg('\u2705 Copied! Paste in Gmail');}else{showMsg('\u274C Could not copy. Try long-press the preview below.');}"
+        + "fallbackCopy(sig);"
+        + "showMsg('\\u2705 Copied! Paste in Gmail');"
         + "}"
         + "});"
 
@@ -278,9 +226,12 @@ public class EmailTracker {
         + "var pixUrl=getPixelUrl();"
         + "if(navigator.clipboard&&navigator.clipboard.writeText){"
         + "navigator.clipboard.writeText(pixUrl)"
-        + ".then(function(){showMsg('\u2705 Pixel URL copied!');})"
-        + ".catch(function(){if(fallbackCopy(pixUrl)){showMsg('\u2705 Pixel URL copied!');}});"
-        + "}else{if(fallbackCopy(pixUrl)){showMsg('\u2705 Pixel URL copied!');}}"
+        + ".then(function(){showMsg('\\u2705 Pixel URL copied!');})"
+        + ".catch(function(){fallbackCopy(pixUrl);showMsg('\\u2705 Pixel URL copied!');});"
+        + "}else{"
+        + "fallbackCopy(pixUrl);"
+        + "showMsg('\\u2705 Pixel URL copied!');"
+        + "}"
         + "});"
 
         + "document.getElementById('gmailBtn').addEventListener('click',function(){"
@@ -304,7 +255,7 @@ public class EmailTracker {
         html.append("*{margin:0;padding:0;box-sizing:border-box}");
         html.append("body{font-family:-apple-system,'Segoe UI',system-ui,sans-serif;background:#0a0a1a;color:#e2e8f0;padding:1.5rem;min-height:100vh}");
         html.append("h1{font-size:1.6rem;color:#a78bfa;margin-bottom:0.3rem}");
-        html.append(".sub{color:#64748b;margin-bottom:1rem;font-size:0.9rem}");
+        html.append(".sub{color:#64748b;margin-bottom:1.5rem;font-size:0.9rem}");
         html.append(".nav{display:flex;gap:0.5rem;margin-bottom:1.2rem}");
         html.append(".nav a{flex:1;text-align:center;padding:0.5rem;background:#1a1a2e;border:1px solid #2a2a4a;border-radius:8px;color:#94a3b8;text-decoration:none;font-size:0.85rem}");
         html.append(".nav a.active{border-color:#7c3aed;color:#a78bfa}");
@@ -317,12 +268,9 @@ public class EmailTracker {
         html.append("td{padding:0.6rem 0.8rem;border-top:1px solid #2a2a4a;font-size:0.85rem}");
         html.append("tr:hover td{background:#1e1e36}");
         html.append(".empty{text-align:center;padding:2.5rem;color:#475569}");
-        html.append(".badge{padding:3px 10px;border-radius:8px;font-size:0.75rem;font-weight:600}");
-        html.append(".badge-read{background:#0a2a1a;color:#4ade80;border:1px solid #166534}");
-        html.append(".badge-delivered{background:#1a1a2e;color:#60a5fa;border:1px solid #1e40af}");
-        html.append(".badge-campaign{background:#2e1065;color:#c4b5fd;border:1px solid #5b21b6}");
-        html.append(".badge-client{background:#164e63;color:#67e8f9;border:1px solid #0e7490}");
-        html.append("@media(max-width:600px){th:nth-child(5),td:nth-child(5){display:none}}");
+        html.append(".badge{background:#7c3aed;color:#fff;padding:2px 8px;border-radius:8px;font-size:0.7rem;font-weight:600}");
+        html.append(".badge-client{background:#0e7490;color:#fff;padding:2px 8px;border-radius:8px;font-size:0.7rem}");
+        html.append("@media(max-width:600px){th:nth-child(5),td:nth-child(5),th:nth-child(6),td:nth-child(6){display:none}}");
         html.append("</style></head><body>");
 
         html.append("<h1>\uD83D\uDCE7 Email Open Tracker</h1>");
@@ -333,51 +281,37 @@ public class EmailTracker {
         html.append("<a href='/dashboard' class='active'>Dashboard</a>");
         html.append("</div>");
 
-        // Stats
-        long totalRead = openLogs.stream().filter(l -> l.get("status").contains("Read")).count();
-        long totalDelivered = openLogs.stream().filter(l -> "Delivered".equals(l.get("status"))).count();
-        long unique = openLogs.stream().map(l -> l.get("recipient").toLowerCase()).distinct().count();
+        long unique = openLogs.stream().map(l -> l.get("recipient")).distinct().count();
+        long camps = openLogs.stream().map(l -> l.get("campaign")).distinct().count();
+        String lastOpen = openLogs.isEmpty() ? "\u2014" : openLogs.get(openLogs.size() - 1).get("opened_at");
 
         html.append("<div class='stats'>");
-        html.append("<div class='card'><h3>Total Emails</h3><div class='val'>").append(openLogs.size()).append("</div></div>");
-        html.append("<div class='card'><h3>\u2705 Read</h3><div class='val' style='color:#4ade80'>").append(totalRead).append("</div></div>");
-        html.append("<div class='card'><h3>\uD83D\uDCE8 Delivered</h3><div class='val' style='color:#60a5fa'>").append(totalDelivered).append("</div></div>");
-        html.append("<div class='card'><h3>Unique People</h3><div class='val'>").append(unique).append("</div></div>");
+        html.append("<div class='card'><h3>Total Opens</h3><div class='val'>").append(openLogs.size()).append("</div></div>");
+        html.append("<div class='card'><h3>Unique Recipients</h3><div class='val'>").append(unique).append("</div></div>");
+        html.append("<div class='card'><h3>Campaigns</h3><div class='val'>").append(camps).append("</div></div>");
+        html.append("<div class='card'><h3>Last Open</h3><div class='val' style='font-size:0.95rem;color:#94a3b8'>").append(esc(lastOpen)).append("</div></div>");
         html.append("</div>");
 
-        // Table
         html.append("<table><thead><tr>");
-        html.append("<th>#</th><th>Recipient</th><th>Status</th><th>Time</th><th>IP</th><th>Via</th>");
+        html.append("<th>#</th><th>Recipient</th><th>Campaign</th><th>Opened At</th><th>IP</th><th>Client</th>");
         html.append("</tr></thead><tbody>");
 
         if (openLogs.isEmpty()) {
-            html.append("<tr><td colspan='6' class='empty'>No emails tracked yet \u2014 use the Compose page to send a tracked email!</td></tr>");
+            html.append("<tr><td colspan='6' class='empty'>No opens yet \u2014 send an email with the tracking pixel!</td></tr>");
         } else {
             for (int i = openLogs.size() - 1; i >= 0; i--) {
                 Map<String, String> l = openLogs.get(i);
-                String status = l.getOrDefault("status", "Read \u2705");
-                String badgeClass = status.contains("Read") ? "badge-read" : "badge-delivered";
-
                 html.append("<tr>");
                 html.append("<td>").append(i + 1).append("</td>");
-                html.append("<td><strong>").append(esc(l.get("recipient"))).append("</strong><br><span style='font-size:0.7rem;color:#64748b'>").append(esc(l.get("campaign"))).append("</span></td>");
-                html.append("<td><span class='badge ").append(badgeClass).append("'>").append(esc(status)).append("</span></td>");
+                html.append("<td><strong>").append(esc(l.get("recipient"))).append("</strong></td>");
+                html.append("<td><span class='badge'>").append(esc(l.get("campaign"))).append("</span></td>");
                 html.append("<td>").append(esc(l.get("opened_at"))).append("</td>");
                 html.append("<td>").append(esc(l.get("ip_address"))).append("</td>");
-                html.append("<td><span class='badge badge-client'>").append(esc(l.get("email_client"))).append("</span></td>");
+                html.append("<td><span class='badge-client'>").append(esc(l.get("email_client"))).append("</span></td>");
                 html.append("</tr>");
             }
         }
         html.append("</tbody></table>");
-
-        // Legend
-        html.append("<div style='margin-top:1rem;padding:1rem;background:#1a1a2e;border:1px solid #2a2a4a;border-radius:10px;font-size:0.8rem;color:#94a3b8;line-height:1.8'>");
-        html.append("<strong style='color:#a78bfa'>Status guide:</strong><br>");
-        html.append("<span class='badge badge-delivered'>Delivered</span> = Email reached their inbox (Gmail loaded the image)<br>");
-        html.append("<span class='badge badge-read'>Read \u2705</span> = Recipient actually opened and viewed your email<br>");
-        html.append("<span style='color:#64748b'>Duplicates within 5 minutes are automatically merged</span>");
-        html.append("</div>");
-
         html.append("</body></html>");
         respond(exchange, 200, "text/html", html.toString().getBytes("UTF-8"));
     }
@@ -390,14 +324,27 @@ public class EmailTracker {
             json.append("{");
             json.append("\"recipient\":\"").append(je(l.get("recipient"))).append("\",");
             json.append("\"campaign\":\"").append(je(l.get("campaign"))).append("\",");
-            json.append("\"status\":\"").append(je(l.get("status"))).append("\",");
             json.append("\"opened_at\":\"").append(je(l.get("opened_at"))).append("\",");
             json.append("\"ip_address\":\"").append(je(l.get("ip_address"))).append("\",");
-            json.append("\"email_client\":\"").append(je(l.get("email_client"))).append("\"");
+            json.append("\"email_client\":\"").append(je(l.get("email_client"))).append("\",");
+            json.append("\"user_agent\":\"").append(je(l.get("user_agent"))).append("\"");
             json.append("}");
         }
         json.append("]");
         respond(exchange, 200, "application/json", json.toString().getBytes("UTF-8"));
+    }
+
+    private static String detectEmailClient(String ua) {
+        if (ua == null) return "Unknown";
+        ua = ua.toLowerCase();
+        if (ua.contains("thunderbird")) return "Thunderbird";
+        if (ua.contains("outlook")) return "Outlook";
+        if (ua.contains("googleimageproxy")) return "Gmail (proxy)";
+        if (ua.contains("apple mail")) return "Apple Mail";
+        if (ua.contains("yahoo")) return "Yahoo Mail";
+        if (ua.contains("android")) return "Android Mail";
+        if (ua.contains("iphone") || ua.contains("ipad")) return "iOS Mail";
+        return "Other";
     }
 
     private static Map<String, String> parseQuery(String query) {
